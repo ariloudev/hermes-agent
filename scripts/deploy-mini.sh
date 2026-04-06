@@ -10,6 +10,8 @@
 #   bash scripts/deploy-mini.sh --stage      # deploy to stage
 #   bash scripts/deploy-mini.sh --skip-build # reuse existing image
 #   bash scripts/deploy-mini.sh --stage --skip-build
+#   bash scripts/deploy-mini.sh --camofox    # deploy Camofox browser sidecar
+#   bash scripts/deploy-mini.sh --openwebui  # deploy Open WebUI
 #
 # Prerequisites:
 #   - Docker running locally
@@ -19,6 +21,14 @@
 # ============================================================================
 
 set -euo pipefail
+
+# --- Preflight: verify Docker context ----------------------------------------
+CURRENT_CONTEXT=$(docker context show 2>/dev/null)
+if [[ "$CURRENT_CONTEXT" != "mini" ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m Docker context is '${CURRENT_CONTEXT}', expected 'mini'."
+    echo "       Run: docker context use mini"
+    exit 1
+fi
 
 # --- Configuration -----------------------------------------------------------
 IMAGE_NAME="hermes-agent"
@@ -37,9 +47,29 @@ SHM_SIZE="1g"
 CPU_LIMIT="2"
 API_PORT="8642"
 
+# --- Camofox defaults --------------------------------------------------------
+CAMOFOX_REPO="https://github.com/jo-inc/camofox-browser.git"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CAMOFOX_BUILD_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/../camofox"
+CAMOFOX_IMAGE="camofox-browser:latest"
+CAMOFOX_TARBALL="/tmp/camofox-image.tar.gz"
+CAMOFOX_REMOTE_TARBALL="/tmp/camofox-image.tar.gz"
+CAMOFOX_CONTAINER="camofox"
+CAMOFOX_PORT="9377"
+CAMOFOX_PROFILE_DIR="~/.camofox-profiles"
+
+# --- Open WebUI defaults -----------------------------------------------------
+OPENWEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+OPENWEBUI_CONTAINER="open-webui"
+OPENWEBUI_PORT="3000"
+OPENWEBUI_DATA_DIR="~/.open-webui"
+
 # --- Options -----------------------------------------------------------------
 SKIP_BUILD=false
+SKIP_HERMES=false
 STAGE=false
+CAMOFOX=false
+OPENWEBUI=false
 
 # --- Colors ------------------------------------------------------------------
 RED='\033[0;31m'
@@ -58,13 +88,19 @@ step()  { echo -e "\n${BOLD}==> $*${NC}"; }
 # --- Argument parsing --------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --skip-build) SKIP_BUILD=true; shift ;;
-        --stage)      STAGE=true; shift ;;
+        --skip-build)  SKIP_BUILD=true; shift ;;
+        --skip-hermes) SKIP_HERMES=true; shift ;;
+        --stage)       STAGE=true; shift ;;
+        --camofox)     CAMOFOX=true; shift ;;
+        --openwebui)   OPENWEBUI=true; shift ;;
         -h|--help)
-            echo "Usage: deploy-mini.sh [--stage] [--skip-build] [-h|--help]"
+            echo "Usage: deploy-mini.sh [--stage] [--skip-build] [--skip-hermes] [--camofox] [--openwebui] [-h|--help]"
             echo ""
             echo "  --stage        Deploy to stage environment (hermes-stage container)"
             echo "  --skip-build   Skip Docker build, reuse existing local image"
+            echo "  --skip-hermes  Skip Hermes deployment entirely (use with --camofox/--openwebui)"
+            echo "  --camofox      Deploy Camofox browser sidecar on the Mac mini"
+            echo "  --openwebui    Deploy Open WebUI on the Mac mini"
             echo "  -h, --help     Show this help message"
             exit 0
             ;;
@@ -86,8 +122,13 @@ else
 fi
 
 # --- Cleanup trap ------------------------------------------------------------
-cleanup() { rm -f "$TARBALL"; }
+cleanup() { rm -f "$TARBALL" "$CAMOFOX_TARBALL"; }
 trap cleanup EXIT
+
+# --- Hermes deployment (skipped with --skip-hermes) --------------------------
+if [[ "$SKIP_HERMES" == true ]]; then
+    warn "Skipping Hermes deployment (--skip-hermes)"
+else
 
 # --- Step 1: Build -----------------------------------------------------------
 step "1/6 Building Docker image"
@@ -160,12 +201,123 @@ ok "Container '$CONTAINER_NAME' started"
 # --- Cleanup remote tarball --------------------------------------------------
 ssh "$REMOTE_HOST" "rm -f ${REMOTE_TARBALL}"
 
+fi # end --skip-hermes guard
+
+# --- Deploy Camofox sidecar --------------------------------------------------
+if [[ "$CAMOFOX" == true ]]; then
+    step "Deploying Camofox browser sidecar"
+
+    info "Building Camofox locally (ARCH=aarch64)"
+    if [[ -d "$CAMOFOX_BUILD_DIR" ]]; then
+        git -C "$CAMOFOX_BUILD_DIR" pull --ff-only
+    else
+        git clone "$CAMOFOX_REPO" "$CAMOFOX_BUILD_DIR"
+    fi
+    make -C "$CAMOFOX_BUILD_DIR" build ARCH=aarch64
+    # The Makefile tags as camofox-browser:<version>-<arch>; re-tag for deploy
+    CAMOFOX_BUILT_TAG=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^camofox-browser:' | head -1)
+    docker tag "$CAMOFOX_BUILT_TAG" "$CAMOFOX_IMAGE"
+    ok "Image built: $CAMOFOX_IMAGE (from $CAMOFOX_BUILT_TAG)"
+
+    info "Saving Camofox image to tarball"
+    docker save "$CAMOFOX_IMAGE" | gzip > "$CAMOFOX_TARBALL"
+    CAMOFOX_TARBALL_SIZE=$(du -h "$CAMOFOX_TARBALL" | cut -f1)
+    ok "Saved $CAMOFOX_IMAGE ($CAMOFOX_TARBALL_SIZE)"
+
+    info "Transferring Camofox image to $REMOTE_HOST"
+    rsync -ahP "$CAMOFOX_TARBALL" "${REMOTE_HOST}:${CAMOFOX_REMOTE_TARBALL}"
+    ok "Transfer complete"
+
+    info "Loading Camofox image on $REMOTE_HOST"
+    ssh "$REMOTE_HOST" "gunzip -c ${CAMOFOX_REMOTE_TARBALL} | docker load"
+    ssh "$REMOTE_HOST" "rm -f ${CAMOFOX_REMOTE_TARBALL}"
+    ok "Image loaded"
+
+    info "Stopping existing Camofox container"
+    ssh "$REMOTE_HOST" bash <<REMOTE_CAMOFOX_STOP
+if docker ps -a --format '{{.Names}}' | grep -qx ${CAMOFOX_CONTAINER}; then
+    echo "Stopping '${CAMOFOX_CONTAINER}'..."
+    docker stop -t ${STOP_TIMEOUT} ${CAMOFOX_CONTAINER} 2>/dev/null || true
+    docker rm ${CAMOFOX_CONTAINER} 2>/dev/null || true
+    echo "Removed old container."
+else
+    echo "No existing Camofox container found."
+fi
+REMOTE_CAMOFOX_STOP
+    ok "Ready for new Camofox container"
+
+    ssh "$REMOTE_HOST" "mkdir -p ${CAMOFOX_PROFILE_DIR}"
+    ssh "$REMOTE_HOST" docker run -d \
+        --name "$CAMOFOX_CONTAINER" \
+        --restart unless-stopped \
+        --network claw-net \
+        --memory="1g" \
+        --cpus="1" \
+        --shm-size="512m" \
+        -e CAMOFOX_PORT="$CAMOFOX_PORT" \
+        -e CAMOFOX_PROFILE_DIR=/profiles \
+        -v "${CAMOFOX_PROFILE_DIR}:/profiles" \
+        -p "${CAMOFOX_PORT}:${CAMOFOX_PORT}" \
+        "$CAMOFOX_IMAGE"
+    ok "Container '$CAMOFOX_CONTAINER' started on port $CAMOFOX_PORT"
+fi
+
+# --- Deploy Open WebUI -------------------------------------------------------
+if [[ "$OPENWEBUI" == true ]]; then
+    step "Deploying Open WebUI"
+
+    info "Pulling $OPENWEBUI_IMAGE on $REMOTE_HOST"
+    ssh "$REMOTE_HOST" "docker pull $OPENWEBUI_IMAGE"
+    ok "Image pulled"
+
+    info "Stopping existing Open WebUI container"
+    ssh "$REMOTE_HOST" bash <<REMOTE_OPENWEBUI_STOP
+if docker ps -a --format '{{.Names}}' | grep -qx ${OPENWEBUI_CONTAINER}; then
+    echo "Stopping '${OPENWEBUI_CONTAINER}'..."
+    docker stop -t ${STOP_TIMEOUT} ${OPENWEBUI_CONTAINER} 2>/dev/null || true
+    docker rm ${OPENWEBUI_CONTAINER} 2>/dev/null || true
+    echo "Removed old container."
+else
+    echo "No existing Open WebUI container found."
+fi
+REMOTE_OPENWEBUI_STOP
+    ok "Ready for new Open WebUI container"
+
+    ssh "$REMOTE_HOST" "mkdir -p ${OPENWEBUI_DATA_DIR}"
+    ssh "$REMOTE_HOST" docker run -d \
+        --name "$OPENWEBUI_CONTAINER" \
+        --restart unless-stopped \
+        --network claw-net \
+        --memory="2g" \
+        --cpus="1" \
+        -v "${OPENWEBUI_DATA_DIR}:/app/backend/data" \
+        -p "${OPENWEBUI_PORT}:8080" \
+        "$OPENWEBUI_IMAGE"
+    ok "Container '$OPENWEBUI_CONTAINER' started on port $OPENWEBUI_PORT"
+fi
+
 # --- Verify ------------------------------------------------------------------
 step "Done — ${CONTAINER_NAME}"
 ssh "$REMOTE_HOST" "docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'"
+if [[ "$CAMOFOX" == true ]]; then
+    ssh "$REMOTE_HOST" "docker ps --filter name=${CAMOFOX_CONTAINER} --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'"
+fi
+if [[ "$OPENWEBUI" == true ]]; then
+    ssh "$REMOTE_HOST" "docker ps --filter name=${OPENWEBUI_CONTAINER} --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'"
+fi
 echo ""
 info "Logs:  ssh $REMOTE_HOST docker logs -f $CONTAINER_NAME"
 info "Stop:  ssh $REMOTE_HOST docker stop $CONTAINER_NAME"
+if [[ "$CAMOFOX" == true ]]; then
+    info "Camofox logs:  ssh $REMOTE_HOST docker logs -f $CAMOFOX_CONTAINER"
+    info "Camofox stop:  ssh $REMOTE_HOST docker stop $CAMOFOX_CONTAINER"
+    info "Set CAMOFOX_URL=http://${CAMOFOX_CONTAINER}:${CAMOFOX_PORT} in your Hermes .env"
+fi
+if [[ "$OPENWEBUI" == true ]]; then
+    info "Open WebUI logs:  ssh $REMOTE_HOST docker logs -f $OPENWEBUI_CONTAINER"
+    info "Open WebUI stop:  ssh $REMOTE_HOST docker stop $OPENWEBUI_CONTAINER"
+    info "Open WebUI UI:    http://mini:${OPENWEBUI_PORT}"
+fi
 if [[ "$STAGE" == true ]]; then
     info "Data:  $REMOTE_DATA_DIR on $REMOTE_HOST"
     info "Nuke:  ssh $REMOTE_HOST 'docker rm -f $CONTAINER_NAME && rm -rf $REMOTE_DATA_DIR'"
