@@ -519,17 +519,66 @@ class TestMessageRouting:
         assert "<@U_BOT>" not in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_bot_messages_ignored(self, adapter):
-        """Messages from bots should be ignored."""
+    async def test_own_bot_messages_ignored(self, adapter):
+        """Messages from our own bot should always be ignored (self-loop prevention)."""
         event = {
-            "text": "bot response",
-            "bot_id": "B_OTHER",
+            "text": "my own reply",
+            "bot_id": "B_SELF",
+            "user": "U_BOT",  # matches adapter._bot_user_id
             "channel": "C123",
             "channel_type": "im",
             "ts": "1234567890.000001",
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_third_party_bot_without_mention_ignored(self, adapter):
+        """Third-party bot messages without @mention should be ignored."""
+        event = {
+            "text": "bot response with no mention",
+            "bot_id": "B_OTHER",
+            "user": "U_JIRA_BOT",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000002",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_third_party_bot_with_mention_processed(self, adapter):
+        """Third-party bot messages that @mention us should be processed (CTP-17)."""
+        event = {
+            "text": "<@U_BOT> There is a Jira update on CTP-15. Review and act on this ticket.",
+            "bot_id": "B_JIRA",
+            "user": "U_JIRA_BOT",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000003",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        # The @mention should be stripped from the text
+        assert "<@U_BOT>" not in msg_event.text
+        assert "Jira update" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_third_party_bot_with_mention_in_channel(self, adapter):
+        """Third-party bot @mentioning us in a channel should be processed."""
+        event = {
+            "text": "<@U_BOT> Build failed for PR #42",
+            "bot_id": "B_GITHUB",
+            "user": "U_GITHUB_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000004",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "<@U_BOT>" not in msg_event.text
 
     @pytest.mark.asyncio
     async def test_message_edits_ignored(self, adapter):
