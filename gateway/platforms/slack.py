@@ -730,9 +730,21 @@ class SlackAdapter(BasePlatformAdapter):
                     if v > cutoff
                 }
 
-        # Ignore bot messages (including our own)
-        if event.get("bot_id") or event.get("subtype") == "bot_message":
-            return
+        # Bot message handling (CTP-17): only ignore our OWN bot messages
+        # to prevent self-reply loops.  Third-party bot/automation messages
+        # (Jira, GitHub, PagerDuty …) are allowed through when they @mention us.
+        is_bot_msg = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+        if is_bot_msg:
+            event_user = event.get("user", "")
+            own_bot_ids = set(self._team_bot_user_ids.values())
+            if self._bot_user_id:
+                own_bot_ids.add(self._bot_user_id)
+            if event_user in own_bot_ids:
+                return  # self-loop — always ignore
+            # Third-party bot: only process if it @mentions us
+            msg_text = event.get("text", "")
+            if not any(f"<@{uid}>" in msg_text for uid in own_bot_ids if uid):
+                return
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
@@ -768,7 +780,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not is_dm and bot_uid:
             if f"<@{bot_uid}>" not in text:
                 return
-            # Strip the bot mention from the text
+        # Strip the bot @mention from the text wherever it appears
+        # (channels, and DM bot messages that include an explicit @mention)
+        if bot_uid and f"<@{bot_uid}>" in text:
             text = text.replace(f"<@{bot_uid}>", "").strip()
 
         # Determine message type
