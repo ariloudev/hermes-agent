@@ -156,6 +156,9 @@ def detect_dangerous_command(command: str) -> tuple:
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
+
+    Note: Returns only the FIRST match. For all matches, use
+    detect_all_dangerous_patterns().
     """
     command_lower = _normalize_command_for_detection(command).lower()
     for pattern, description in DANGEROUS_PATTERNS:
@@ -163,6 +166,21 @@ def detect_dangerous_command(command: str) -> tuple:
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def detect_all_dangerous_patterns(command: str) -> list[tuple[str, str]]:
+    """Return ALL dangerous patterns matched by a command.
+
+    Returns:
+        List of (pattern_key, description) tuples for every matching pattern.
+        Empty list if the command is safe.
+    """
+    command_lower = _normalize_command_for_detection(command).lower()
+    matches = []
+    for pattern, description in DANGEROUS_PATTERNS:
+        if re.search(pattern, command_lower, re.IGNORECASE | re.DOTALL):
+            matches.append((description, description))
+    return matches
 
 
 # =========================================================================
@@ -680,8 +698,11 @@ def check_all_command_guards(command: str, env_type: str,
     except ImportError:
         pass  # tirith module not installed — allow
 
-    # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # Dangerous command check — detect ALL matching patterns so a single
+    # approval prompt covers every triggered rule.  Previously only the
+    # first match was returned, which left subsequent patterns un-approved
+    # and could cause infinite approval loops (CTP-16).
+    dangerous_matches = detect_all_dangerous_patterns(command)
 
     # --- Phase 2: Decide ---
 
@@ -702,7 +723,7 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
-    if is_dangerous:
+    for pattern_key, description in dangerous_matches:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
