@@ -6,6 +6,7 @@ __pycache__/
 .vscode/
 .env
 .env.local
+.env.stage
 .env.development.local
 .env.test.local
 .env.production.local
@@ -58,3 +59,8 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+/.idea/hermes-agent.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/vcs.xml

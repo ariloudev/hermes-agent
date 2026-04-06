@@ -132,6 +132,14 @@ fi
 REMOTE_STOP
 ok "Ready for new container"
 
+# --- Copy .env.stage for stage deployments -----------------------------------
+if [[ "$STAGE" == true ]]; then
+    step "Copying .env.stage to ${REMOTE_DATA_DIR}/.env"
+    ssh "$REMOTE_HOST" "mkdir -p ${REMOTE_DATA_DIR}"
+    rsync -ah .env.stage "${REMOTE_HOST}:${REMOTE_DATA_DIR}/.env"
+    ok ".env.stage deployed"
+fi
+
 # --- Step 6: Start new container ---------------------------------------------
 step "6/6 Starting new container"
 ssh "$REMOTE_HOST" docker run -d \
