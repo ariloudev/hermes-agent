@@ -1,17 +1,21 @@
 #!/bin/bash
 # ============================================================================
-# Hermes Agent — Deploy to Mac mini
+# Hermes Agent — Deploy to Mac mini (prod + stage)
 # ============================================================================
 # Builds the Docker image locally and deploys it to the Mac mini.
+# Supports both production and stage environments.
 #
 # Usage:
-#   bash scripts/deploy-mini.sh
-#   bash scripts/deploy-mini.sh --skip-build    # reuse existing image
+#   bash scripts/deploy-mini.sh              # deploy to prod
+#   bash scripts/deploy-mini.sh --stage      # deploy to stage
+#   bash scripts/deploy-mini.sh --skip-build # reuse existing image
+#   bash scripts/deploy-mini.sh --stage --skip-build
 #
 # Prerequisites:
 #   - Docker running locally
 #   - SSH access to openclaw@mini (key-based auth recommended)
 #   - Docker running on the Mac mini
+#   - For stage: ~/.hermes-stage/ on the Mini with .env and config.yaml
 # ============================================================================
 
 set -euo pipefail
@@ -20,18 +24,22 @@ set -euo pipefail
 IMAGE_NAME="hermes-agent"
 IMAGE_TAG="latest"
 IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-CONTAINER_NAME="hermes"
 REMOTE_HOST="openclaw@mini"
-REMOTE_DATA_DIR="~/.hermes"
 TARBALL="/tmp/hermes-agent-image.tar.gz"
 REMOTE_TARBALL="/tmp/hermes-agent-image.tar.gz"
+STOP_TIMEOUT=30
+
+# --- Defaults (prod) — overridden by --stage --------------------------------
+CONTAINER_NAME="hermes"
+REMOTE_DATA_DIR="~/.hermes"
 MEMORY_LIMIT="4g"
 SHM_SIZE="1g"
 CPU_LIMIT="2"
-STOP_TIMEOUT=30
+API_PORT="8642"
 
 # --- Options -----------------------------------------------------------------
 SKIP_BUILD=false
+STAGE=false
 
 # --- Colors ------------------------------------------------------------------
 RED='\033[0;31m'
@@ -51,9 +59,11 @@ step()  { echo -e "\n${BOLD}==> $*${NC}"; }
 while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-build) SKIP_BUILD=true; shift ;;
+        --stage)      STAGE=true; shift ;;
         -h|--help)
-            echo "Usage: deploy-mini.sh [--skip-build] [-h|--help]"
+            echo "Usage: deploy-mini.sh [--stage] [--skip-build] [-h|--help]"
             echo ""
+            echo "  --stage        Deploy to stage environment (hermes-stage container)"
             echo "  --skip-build   Skip Docker build, reuse existing local image"
             echo "  -h, --help     Show this help message"
             exit 0
@@ -61,6 +71,19 @@ while [[ $# -gt 0 ]]; do
         *) err "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# --- Apply stage overrides ---------------------------------------------------
+if [[ "$STAGE" == true ]]; then
+    CONTAINER_NAME="hermes-stage"
+    REMOTE_DATA_DIR="~/.hermes-stage"
+    MEMORY_LIMIT="3g"
+    SHM_SIZE="512m"
+    CPU_LIMIT="1.5"
+    API_PORT="8643"
+    info "Deploying to ${BOLD}STAGE${NC} environment"
+else
+    info "Deploying to ${BOLD}PRODUCTION${NC} environment"
+fi
 
 # --- Cleanup trap ------------------------------------------------------------
 cleanup() { rm -f "$TARBALL"; }
@@ -121,7 +144,7 @@ ssh "$REMOTE_HOST" docker run -d \
     -v "${REMOTE_DATA_DIR}:/opt/data" \
     -e API_SERVER_ENABLED=true \
     -e API_SERVER_HOST=0.0.0.0 \
-    -p 8642:8642 \
+    -p "${API_PORT}:8642" \
     "$IMAGE" \
     gateway run
 ok "Container '$CONTAINER_NAME' started"
@@ -130,8 +153,12 @@ ok "Container '$CONTAINER_NAME' started"
 ssh "$REMOTE_HOST" "rm -f ${REMOTE_TARBALL}"
 
 # --- Verify ------------------------------------------------------------------
-step "Done"
-ssh "$REMOTE_HOST" "docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
+step "Done — ${CONTAINER_NAME}"
+ssh "$REMOTE_HOST" "docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'"
 echo ""
 info "Logs:  ssh $REMOTE_HOST docker logs -f $CONTAINER_NAME"
 info "Stop:  ssh $REMOTE_HOST docker stop $CONTAINER_NAME"
+if [[ "$STAGE" == true ]]; then
+    info "Data:  $REMOTE_DATA_DIR on $REMOTE_HOST"
+    info "Nuke:  ssh $REMOTE_HOST 'docker rm -f $CONTAINER_NAME && rm -rf $REMOTE_DATA_DIR'"
+fi
