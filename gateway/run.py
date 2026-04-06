@@ -2206,9 +2206,22 @@ class GatewayRunner:
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
+        # DM thread sessions are re-seeded with the expired transcript (see
+        # session.py), so the agent should know context was preserved.
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "daily":
+            _is_dm_thread = (
+                getattr(source, 'chat_type', None) == "dm"
+                and getattr(source, 'thread_id', None)
+            )
+            if _is_dm_thread:
+                # Thread context was re-seeded from the expired session
+                context_note = (
+                    f"[System note: The user's session in this thread was automatically "
+                    f"reset ({reset_reason}), but conversation history has been restored "
+                    f"from the previous session. Continue the conversation naturally.]"
+                )
+            elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
@@ -2240,12 +2253,18 @@ class GatewayRunner:
                             mins = policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
-                        )
+                        if _is_dm_thread:
+                            notice = (
+                                f"◐ Session automatically reset ({reason_text}). "
+                                f"Thread history restored — conversation context preserved."
+                            )
+                        else:
+                            notice = (
+                                f"◐ Session automatically reset ({reason_text}). "
+                                f"Conversation history cleared.\n"
+                                f"Use /resume to browse and restore a previous session.\n"
+                                f"Adjust reset timing in config.yaml under session_reset."
+                            )
                         try:
                             session_info = self._format_session_info()
                             if session_info:
